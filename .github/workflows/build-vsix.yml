@@ -1,0 +1,56 @@
+name: Build VSIX
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build-vsix:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build VSIX package
+        run: npm run package
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcb-editor-vsix
+          path: "*.vsix"
+          if-no-files-found: error
+
+      - name: Read extension version
+        if: github.event_name != 'pull_request'
+        id: extension_version
+        run: |
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        if: github.event_name != 'pull_request'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ steps.extension_version.outputs.version }}
+          name: v${{ steps.extension_version.outputs.version }}
+          artifacts: "*.vsix"
+          allowUpdates: true
+          replacesArtifacts: true
+          generateReleaseNotes: true
