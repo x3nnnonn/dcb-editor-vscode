@@ -1,0 +1,144 @@
+{
+  "name": "dcb-editor-vscode",
+  "displayName": "DCB Editor",
+  "description": "Browse, edit, create, rename, and delete Star Citizen DCB records directly from VS Code.",
+  "version": "0.1.21",
+  "publisher": "x3nnnonn",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x3nnnonn/dcb-editor-vscode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/x3nnnonn/dcb-editor-vscode/issues"
+  },
+  "homepage": "https://github.com/x3nnnonn/dcb-editor-vscode",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "files": [
+    "extension.js",
+    "dcb-native.js",
+    "LICENSE.txt"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "dcb",
+    "datacore",
+    "star citizen",
+    "xml",
+    "modding"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "scripts": {
+    "verify": "node --check extension.js && node --check dcb-native.js",
+    "package": "npm run verify && npx @vscode/vsce package --no-dependencies",
+    "package:legacy": "npm run verify && npx vsce package --no-dependencies",
+    "publish:patch": "npm run verify && npx @vscode/vsce publish patch --no-dependencies",
+    "publish:minor": "npm run verify && npx @vscode/vsce publish minor --no-dependencies",
+    "publish:major": "npm run verify && npx @vscode/vsce publish major --no-dependencies",
+    "publish:vsix": "npm run verify && npx @vscode/vsce publish --packagePath dcb-editor-vscode-*.vsix --no-dependencies"
+  },
+  "activationEvents": [
+    "onCommand:dcbEditor.openDcb",
+    "onCommand:dcbEditor.searchRecords",
+    "onCommand:dcbEditor.importXmlFile",
+    "onCommand:dcbEditor.importActiveXml",
+    "onView:dcbEditorExplorer",
+    "onFileSystem:dcb"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "dcbEditor.openDcb",
+        "title": "DCB: Open DCB"
+      },
+      {
+        "command": "dcbEditor.closeDcb",
+        "title": "DCB: Close Session"
+      },
+      {
+        "command": "dcbEditor.searchRecords",
+        "title": "DCB: Search Records"
+      },
+      {
+        "command": "dcbEditor.openRecord",
+        "title": "DCB: Open Record XML"
+      },
+      {
+        "command": "dcbEditor.saveDcb",
+        "title": "DCB: Save Session To Source"
+      },
+      {
+        "command": "dcbEditor.importXmlFile",
+        "title": "DCB: Import XML File"
+      },
+      {
+        "command": "dcbEditor.importActiveXml",
+        "title": "DCB: Import Active XML"
+      },
+      {
+        "command": "dcbEditor.refresh",
+        "title": "DCB: Refresh Explorer"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "dcbEditorExplorer",
+          "name": "DCB Editor"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "DCB Editor",
+      "properties": {
+        "dcbEditor.searchLimit": {
+          "type": "number",
+          "default": 200,
+          "minimum": 1,
+          "description": "Maximum number of records returned by a search."
+        },
+        "dcbEditor.autoSaveDcbOnXmlSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, saving an opened record XML also writes the DCB session back to the original DCB file."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "dcbEditor.openDcb",
+          "when": "view == dcbEditorExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dcbEditor.searchRecords",
+          "when": "view == dcbEditorExplorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dcbEditor.importXmlFile",
+          "when": "view == dcbEditorExplorer",
+          "group": "navigation@3"
+        },
+        {
+          "command": "dcbEditor.saveDcb",
+          "when": "view == dcbEditorExplorer",
+          "group": "navigation@4"
+        },
+        {
+          "command": "dcbEditor.refresh",
+          "when": "view == dcbEditorExplorer",
+          "group": "navigation@5"
+        }
+      ]
+    }
+  }
+}
