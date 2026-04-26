@@ -2,7 +2,7 @@
   "name": "dcb-editor-vscode",
   "displayName": "DCB Editor",
   "description": "Browse, edit, create, rename, and delete Star Citizen DCB records directly from VS Code.",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "publisher": "x3nnnonn",
   "license": "MIT",
   "repository": {

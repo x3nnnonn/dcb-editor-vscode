@@ -840,9 +840,7 @@ class NativeDcbSession {
     }
 
     const fileNameOffset = this._appendString1(normalizedFileName);
-    const nameOffset = this.version >= 8
-      ? this._appendString1(normalizedName)
-      : this._appendString2(normalizedName);
+    const nameOffset = this._appendString2(normalizedName);
 
     this._parse();
 
@@ -3279,7 +3277,7 @@ class NativeDcbSession {
       }
       const summary = {
         index,
-        name: this._getString(record.nameOffset, this.version < 8),
+        name: this._getString(record.nameOffset, true),
         typeName,
         fileName,
         guid: record.guid
