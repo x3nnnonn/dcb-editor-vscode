@@ -2072,6 +2072,15 @@ class NativeDcbSession {
   }
 
   _applyClassArrayEdits(index, editedRoot) {
+    const currentFileName = this.recordSummaries[index]?.fileName || '';
+    const buildContext = () => ({
+      currentFileName,
+      pointerMap: new Map(),
+      strongPointerTargets: new Map(),
+      strongPointerArrays: new Map(),
+      guidToRecordIndex: this._getRecordGuidToIndexMap(),
+      fileNameToRecordIndex: this._getFileNameToMainRecordIndexMap()
+    });
     let changedValues = 0;
 
     while (true) {
@@ -2088,12 +2097,20 @@ class NativeDcbSession {
         if (descriptor && descriptor.property.dataType === DataType.Class) {
           const originalChildren = originalNode.children || [];
           const editedChildren = editedNode.children || [];
+          const childStructIndex = descriptor.property.structIndex;
           const sameExistingPrefix = editedChildren.length >= originalChildren.length &&
             originalChildren.every((child, childIndex) => {
               const editedChild = editedChildren[childIndex];
               return editedChild && child.name === editedChild.name && JSON.stringify(child.attrs || {}) === JSON.stringify(editedChild.attrs || {});
             });
+          const sameEditedPrefix = editedChildren.length <= originalChildren.length &&
+            editedChildren.every((child, childIndex) => {
+              const originalChild = originalChildren[childIndex];
+              return originalChild && child.name === originalChild.name && JSON.stringify(child.attrs || {}) === JSON.stringify(originalChild.attrs || {});
+            });
+
           if (sameExistingPrefix && editedChildren.length > originalChildren.length) {
+            const oldCount = originalChildren.length;
             const allocation = this._appendClassArrayEntries(descriptor, editedChildren.length);
             const refreshedRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`));
             const refreshedArrays = this._buildRecordArrayFieldIndex(index, refreshedRoot);
@@ -2104,7 +2121,32 @@ class NativeDcbSession {
             this.bytes.writeInt32LE(allocation.count, refreshedDescriptor.arrayAbsoluteOffset);
             this.bytes.writeInt32LE(allocation.count > 0 ? allocation.firstIndex : -1, refreshedDescriptor.arrayAbsoluteOffset + 4);
             this._parse();
+
+            if (childStructIndex >= 0 && childStructIndex < this.structDefinitions.length) {
+              for (let i = oldCount; i < editedChildren.length; i += 1) {
+                const newSlotIndex = allocation.firstIndex + i;
+                const editedChild = editedChildren[i];
+                const context = buildContext();
+                this._primeStringTableForXmlNode(childStructIndex, editedChild);
+                this._parse();
+                this._prepareXmlGraphForStructInstance(childStructIndex, newSlotIndex, editedChild, context);
+                this._parse();
+                this._applyXmlNodeToStructInstance(childStructIndex, newSlotIndex, editedChild, context);
+                this._parse();
+              }
+            }
+
             changedValues += editedChildren.length - originalChildren.length;
+            handled = true;
+            return;
+          }
+
+          if (sameEditedPrefix && editedChildren.length < originalChildren.length) {
+            const nextCount = editedChildren.length;
+            this.bytes.writeInt32LE(nextCount, descriptor.arrayAbsoluteOffset);
+            this.bytes.writeInt32LE(nextCount > 0 ? descriptor.firstIndex : -1, descriptor.arrayAbsoluteOffset + 4);
+            this._parse();
+            changedValues += originalChildren.length - editedChildren.length;
             handled = true;
             return;
           }
