@@ -269,13 +269,43 @@ class DcbExtensionState {
 
   async dispose() {
     try {
-      await this.closeSession();
-      await this.unmountAllDcbWorkspaceFolders();
-      await this.unmountMirrorWorkspace();
+      this.nativeSession = null;
+      this.session = null;
     } catch (error) {
-      this.output.appendLine(`Close session error: ${error.message}`);
+      this.output.appendLine(`Dispose error: ${error.message}`);
     }
     this.output.dispose();
+  }
+
+  async restoreMountedDcbWorkspaceFolders() {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) {
+      return;
+    }
+    const dcbFolders = folders.filter((folder) => folder.uri.scheme === 'dcb');
+    if (dcbFolders.length === 0) {
+      return;
+    }
+    for (const folder of dcbFolders) {
+      const authority = String(folder.uri.authority || '').toLowerCase();
+      if (!authority) {
+        continue;
+      }
+      const sourcePath = this.mountSourceByAuthority.get(authority);
+      if (!sourcePath) {
+        this.output.appendLine(`[dcb fs] no persisted source for existing folder ${folder.uri.toString()}; leaving as-is`);
+        continue;
+      }
+      try {
+        await this.ensureMountedSession(authority);
+        this.mountedWorkspaceUri = folder.uri;
+        this.virtualAuthority = authority;
+        this.fileSystemProvider.refresh(folder.uri);
+        this.output.appendLine(`[dcb fs] restored mount for ${folder.uri.toString()}`);
+      } catch (error) {
+        this.output.appendLine(`[dcb fs] failed to restore ${folder.uri.toString()}: ${error.message}`);
+      }
+    }
   }
 
   async openDcb() {
@@ -288,10 +318,33 @@ class DcbExtensionState {
       return;
     }
 
+    const sourcePath = picked[0].fsPath;
+    const targetAuthority = sanitizeAuthority(path.basename(sourcePath));
+    const willTriggerHostRestart = !vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0;
+
+    if (willTriggerHostRestart) {
+      this.mountSourceByAuthority.set(targetAuthority, sourcePath);
+      await this.context.globalState.update(
+        'dcbEditor.mountSourceByAuthority',
+        Object.fromEntries(this.mountSourceByAuthority.entries())
+      );
+      this.output.appendLine(`[dcb fs] empty window detected; persisting ${targetAuthority} -> ${sourcePath} before mount`);
+      const uri = vscode.Uri.parse(`dcb://${targetAuthority}/`);
+      const folderName = `${path.basename(sourcePath)} [DCB]`;
+      const success = vscode.workspace.updateWorkspaceFolders(0, null, { uri, name: folderName });
+      if (!success) {
+        throw new Error('VS Code could not mount the DCB virtual filesystem.');
+      }
+      vscode.window.showInformationMessage(
+        `Mounting ${path.basename(sourcePath)}... VS Code will reload the window to attach the DCB filesystem.`
+      );
+      return;
+    }
+
     await this.closeSession();
     await this.unmountAllDcbWorkspaceFolders();
 
-    this.output.appendLine(`Opening DCB: ${picked[0].fsPath}`);
+    this.output.appendLine(`Opening DCB: ${sourcePath}`);
     const nativeSession = await NativeDcbSession.open(picked[0].fsPath);
     const payload = nativeSession.getMetadata();
     this.nativeSession = nativeSession;
@@ -2598,7 +2651,7 @@ function isMirrorPlaceholderText(text) {
 async function activate(context) {
   const state = new DcbExtensionState(context);
   const xmlCompletionProvider = new DcbXmlCompletionProvider(state);
-  void state.unmountAllDcbWorkspaceFolders();
+  void state.restoreMountedDcbWorkspaceFolders();
 
   context.subscriptions.push(
     state.output,
