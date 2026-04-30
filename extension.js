@@ -485,6 +485,80 @@ class DcbExtensionState {
     vscode.window.showInformationMessage('Record XML was opened from the DCB. Saving this document writes the changes back to the DCB session.');
   }
 
+  resolveRecordIndexFromArg(arg) {
+    if (arg == null) return null;
+    if (typeof arg === 'number') return arg;
+    if (typeof arg.index === 'number') return arg.index;
+    if (arg.record && typeof arg.record.index === 'number') return arg.record.index;
+    const id = String(arg.id || '');
+    const match = /^(?:file|search-record):(\d+)$/.exec(id);
+    return match ? Number(match[1]) : null;
+  }
+
+  async cloneRecord(arg) {
+    if (!this.session || !this.nativeSession) {
+      throw new Error('No active DCB session');
+    }
+
+    let recordIndex = this.resolveRecordIndexFromArg(arg);
+    if (recordIndex == null) {
+      const picked = await vscode.window.showInputBox({
+        title: 'Clone Record',
+        prompt: 'Right-click a record in the DCB Editor explorer to clone it. (This input is just to dismiss.)',
+        placeHolder: 'Cancel and right-click instead.'
+      });
+      if (picked === undefined) return;
+      throw new Error('Run this command from the right-click menu on a record.');
+    }
+
+    const summary = this.nativeSession.getRecordSummary(recordIndex);
+    if (!summary) {
+      throw new Error(`Record ${recordIndex} was not found.`);
+    }
+
+    const dotIndex = summary.name.indexOf('.');
+    const baseName = dotIndex >= 0 ? summary.name.slice(dotIndex + 1) : summary.name;
+    const typePrefix = dotIndex >= 0 ? summary.name.slice(0, dotIndex) : summary.typeName;
+
+    const newBaseName = await vscode.window.showInputBox({
+      title: `Clone ${summary.name}`,
+      prompt: 'New record name (without the type prefix)',
+      value: `${baseName}_copy`,
+      validateInput: (value) => {
+        const trimmed = String(value || '').trim();
+        if (!trimmed) return 'Name cannot be empty';
+        if (/[\\/:*?"<>|\s]/.test(trimmed)) return 'Name contains invalid characters or whitespace';
+        return null;
+      }
+    });
+    if (!newBaseName) return;
+
+    const trimmedName = newBaseName.trim();
+    const newFullName = `${typePrefix}.${trimmedName}`;
+    const dir = path.posix.dirname(String(summary.fileName || '').replace(/\\/g, '/'));
+    const newFileName = (dir && dir !== '.' ? `${dir}/${trimmedName}.xml` : `${trimmedName}.xml`);
+
+    const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    let xml = this.nativeSession.exportRecordXml(recordIndex);
+    xml = xml.replace(new RegExp(`^<${escapeRegExp(summary.name)}\\b`), `<${newFullName}`);
+    xml = xml.replace(new RegExp(`</${escapeRegExp(summary.name)}>\\s*$`), `</${newFullName}>`);
+    xml = xml.replace(/\sRecordId="[^"]*"/, '');
+
+    const wrappedXml = `<?xml version="1.0" encoding="utf-8"?>\n${xml}\n`;
+    const result = this.nativeSession.createRecordFromXmlScratch(wrappedXml, newFileName);
+
+    this.rebuildVirtualExplorer();
+    this.refreshMirrorBindingsFromSummaries();
+    this.invalidateRecordCaches(result.index);
+    this.treeProvider.refresh();
+    if (vscode.workspace.getConfiguration('dcbEditor').get('autoSaveDcbOnXmlSave', true)) {
+      await this.nativeSession.saveToFile(this.session.sourcePath);
+    }
+    this.output.appendLine(`[dcb clone] ${summary.name} -> ${result.name} (${newFileName})`);
+    vscode.window.showInformationMessage(`Cloned ${summary.name} → ${result.name}`);
+    await this.openRecord({ index: result.index });
+  }
+
   async importXmlFromFile(fileUri) {
     throw new Error('XML file import is not available from this command yet. Open the DCB in the Explorer and create or edit XML there.');
   }
@@ -1835,16 +1909,31 @@ class DcbXmlCompletionProvider {
       new vscode.Position(context.line, context.valueEnd)
     );
     if (context.parentIsArrayContainer && context.parentItemTypeName) {
-      const itemName = encodeXmlNameLocal(context.parentItemTypeName);
-      if (!context.currentValue || itemName.toLowerCase().startsWith(context.currentValue.toLowerCase())) {
+      const subtypeNames = (typeof this.state.nativeSession.getStructSubtypeNames === 'function')
+        ? this.state.nativeSession.getStructSubtypeNames(context.parentItemTypeName)
+        : [];
+      const candidates = subtypeNames.length > 0 ? subtypeNames : [context.parentItemTypeName];
+      const typedPrefix = String(context.currentValue || '').toLowerCase();
+      const items = [];
+      for (const typeName of candidates) {
+        const itemName = encodeXmlNameLocal(typeName);
+        if (typedPrefix && !itemName.toLowerCase().startsWith(typedPrefix)) {
+          continue;
+        }
         const item = new vscode.CompletionItem(itemName, vscode.CompletionItemKind.Struct);
-        item.detail = `${context.parentItemTypeName} array item`;
+        item.detail = typeName === context.parentItemTypeName
+          ? `${typeName} array item`
+          : `${typeName} (subtype of ${context.parentItemTypeName})`;
         item.range = replaceRange;
-        item.insertText = new vscode.SnippetString(buildArrayItemSnippet(context.parentItemTypeName, context.parentItemDataTypeName));
-        item.sortText = `0000_${itemName}`;
-        return new vscode.CompletionList([item], false);
+        item.insertText = new vscode.SnippetString(buildArrayItemSnippet(typeName, context.parentItemDataTypeName));
+        item.sortText = `${(typeName === context.parentItemTypeName ? '0000' : '0001').padStart(4, '0')}_${itemName}`;
+        items.push(item);
+        if (items.length >= 200) break;
       }
-      return undefined;
+      if (items.length === 0) {
+        return undefined;
+      }
+      return new vscode.CompletionList(items, false);
     }
 
     const properties = this.state.nativeSession.getStructPropertyCompletionEntries(context.parentTypeName);
@@ -1993,7 +2082,7 @@ function getAttributeNameContext(lineText, cursorCharacter) {
   if (/^\s*[!?]/.test(afterTagStart)) {
     return null;
   }
-  const match = /(?:^|\s)([A-Za-z0-9_.:-]*)$/.exec(afterTagStart);
+  const match = /\s([A-Za-z0-9_.:-]*)$/.exec(afterTagStart);
   if (!match) {
     return null;
   }
@@ -2679,6 +2768,7 @@ async function activate(context) {
     vscode.commands.registerCommand('dcbEditor.importXmlFile', async (uri) => withErrorHandling(() => state.importXmlFromFile(uri))),
     vscode.commands.registerCommand('dcbEditor.importActiveXml', async () => withErrorHandling(() => state.importActiveXml())),
     vscode.commands.registerCommand('dcbEditor.refresh', async () => withErrorHandling(() => state.refresh())),
+    vscode.commands.registerCommand('dcbEditor.cloneRecord', async (item) => withErrorHandling(() => state.cloneRecord(item))),
     vscode.workspace.onDidOpenTextDocument(async (document) => {
       await withErrorHandling(() => state.handleDocumentOpen(document), false);
     }),

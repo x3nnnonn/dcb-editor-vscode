@@ -194,6 +194,32 @@ function writeGuidAt(buffer, offset, value) {
   Buffer.from(guidBytes).copy(buffer, offset, 0, 16);
 }
 
+function collapseSrgb8XmlText(xmlText) {
+  const source = String(xmlText || '');
+  const re = /<([A-Za-z0-9_.:-]+)((?:\s[^>]*?)?\sType="SRGB8"(?:\s[^>]*)?)>\s*<r>\s*(-?\d+)\s*<\/r>\s*<g>\s*(-?\d+)\s*<\/g>\s*<b>\s*(-?\d+)\s*<\/b>\s*<\/\1>/g;
+  const clamp = (v) => Math.max(0, Math.min(255, Number(v) | 0));
+  const hex = (v) => clamp(v).toString(16).padStart(2, '0');
+  return source.replace(re, (_, name, attrs, r, g, b) => `<${name}${attrs}>#${hex(r)}${hex(g)}${hex(b)}</${name}>`);
+}
+
+function expandSrgb8XmlText(xmlText) {
+  const source = String(xmlText || '');
+  const re = /<([A-Za-z0-9_.:-]+)((?:\s[^>]*?)?\sType="SRGB8"(?:\s[^>]*)?)>\s*#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\s*<\/\1>/g;
+  return source.replace(re, (_, name, attrs, hexValue) => {
+    let r, g, b;
+    if (hexValue.length === 3) {
+      r = parseInt(hexValue[0] + hexValue[0], 16);
+      g = parseInt(hexValue[1] + hexValue[1], 16);
+      b = parseInt(hexValue[2] + hexValue[2], 16);
+    } else {
+      r = parseInt(hexValue.slice(0, 2), 16);
+      g = parseInt(hexValue.slice(2, 4), 16);
+      b = parseInt(hexValue.slice(4, 6), 16);
+    }
+    return `<${name}${attrs}><r>${r}</r><g>${g}</g><b>${b}</b></${name}>`;
+  });
+}
+
 function parsePointerText(value) {
   const text = String(value || '').trim();
   const match = /^(.+)\[([0-9A-Fa-f]+)\]$/.exec(text);
@@ -543,6 +569,7 @@ class NativeDcbSession {
     this.enumValueCache = new Map();
     this.stringTable1Lookup = null;
     this.structNameToIndex = null;
+    this.structSubtypesCache = null;
     this.recordGuidToIndex = null;
     this.fileNameToMainRecordIndex = null;
     this.mainRecordFileCounts = null;
@@ -606,6 +633,46 @@ class NativeDcbSession {
 
   hasStructType(typeName) {
     return this._getStructNameToIndexMap().has(String(typeName || '').trim());
+  }
+
+  getStructSubtypeNames(typeName) {
+    const normalized = String(typeName || '').trim();
+    if (!normalized) return [];
+    const map = this._getStructSubtypesMap();
+    const list = map.get(normalized);
+    return list ? list.slice() : [];
+  }
+
+  _getStructSubtypesMap() {
+    if (this.structSubtypesCache) {
+      return this.structSubtypesCache;
+    }
+    const result = new Map();
+    const definitions = this.structDefinitions;
+    for (let i = 0; i < definitions.length; i += 1) {
+      const selfName = this.structNameCache[i];
+      if (!selfName) continue;
+      let cursor = i;
+      const visited = new Set();
+      while (cursor >= 0 && cursor < definitions.length && !visited.has(cursor)) {
+        visited.add(cursor);
+        const ancestorName = this.structNameCache[cursor];
+        if (ancestorName) {
+          let bucket = result.get(ancestorName);
+          if (!bucket) {
+            bucket = [];
+            result.set(ancestorName, bucket);
+          }
+          bucket.push(selfName);
+        }
+        cursor = definitions[cursor].parentTypeIndex;
+      }
+    }
+    for (const list of result.values()) {
+      list.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+    }
+    this.structSubtypesCache = result;
+    return result;
   }
 
   getStructPropertyCompletionEntries(typeName) {
@@ -815,8 +882,37 @@ class NativeDcbSession {
     };
   }
 
+  _renameRecordInPlace(index, newName) {
+    const summary = this.recordSummaries[index];
+    if (!summary) {
+      throw new Error(`Record ${index} is out of range`);
+    }
+    let normalizedName = String(newName || '').trim();
+    if (!normalizedName) {
+      throw new Error('New record name cannot be empty');
+    }
+    if (!normalizedName.includes('.')) {
+      normalizedName = `${summary.typeName}.${normalizedName}`;
+    } else {
+      const editedType = normalizedName.split('.')[0];
+      if (editedType !== summary.typeName) {
+        throw new Error(`Record name type prefix '${editedType}' does not match record type '${summary.typeName}'`);
+      }
+    }
+    if (normalizedName === summary.name) {
+      return { changed: false };
+    }
+
+    const nameOffset = this._appendString2(normalizedName);
+    const recordStorageSize = this.version >= 8 ? 36 : 32;
+    this.bytes.writeInt32LE(nameOffset, this.recordsOffset + index * recordStorageSize);
+    this.dirty = true;
+    this._parse();
+    return { changed: true, oldName: summary.name, newName: normalizedName };
+  }
+
   createRecordFromXmlScratch(editedXmlText, newFileName) {
-    const parsedRoot = parseXmlDocument(editedXmlText);
+    const parsedRoot = parseXmlDocument(expandSrgb8XmlText(editedXmlText));
     const normalizedType = String(parsedRoot.attrs?.Type || (String(parsedRoot.name || '').includes('.') ? String(parsedRoot.name).split('.')[0] : '')).trim();
     let normalizedName = String(parsedRoot.name || '').trim();
     const normalizedFileName = String(newFileName || '').trim().replace(/\\/g, '/').replace(/^\/+/, '');
@@ -946,27 +1042,36 @@ class NativeDcbSession {
       throw new Error(`Record ${index} is out of range`);
     }
 
-    let originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`);
-    const editedRoot = parseXmlDocument(editedXmlText);
+    const expandedEditedXmlText = expandSrgb8XmlText(editedXmlText);
+    let originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`);
+    const editedRoot = parseXmlDocument(expandedEditedXmlText);
     if (originalRoot.name !== editedRoot.name) {
       const editedType = String(editedRoot.attrs?.Type || (String(editedRoot.name || '').includes('.') ? String(editedRoot.name).split('.')[0] : '')).trim();
-      if (editedType && editedType === summary.typeName) {
+      const sameType = editedType && editedType === summary.typeName;
+      const editedNameSuffix = String(editedRoot.name || '').includes('.')
+        ? String(editedRoot.name).split('.').slice(1).join('.')
+        : String(editedRoot.name || '');
+      if (sameType && editedNameSuffix) {
+        this._renameRecordInPlace(index, editedRoot.name);
+        originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`);
+      } else if (sameType) {
         return this.replaceRecordXml(index, editedXmlText);
+      } else {
+        throw new Error('Edited XML root does not match the selected record');
       }
-      throw new Error('Edited XML root does not match the selected record');
     }
 
     const classArrayResult = this._applyClassArrayEdits(index, editedRoot);
     if (classArrayResult.changedValues > 0) {
-      originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`);
+      originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`);
     }
     const strongPointerArrayResult = this._applyStrongPointerArrayEdits(index, editedRoot);
     if (strongPointerArrayResult.changedValues > 0) {
-      originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`);
+      originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`);
     }
     const referenceArrayResult = this._applyReferenceArrayEdits(index, originalRoot, editedRoot);
     if (referenceArrayResult.changedValues > 0) {
-      originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`);
+      originalRoot = parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`);
     }
 
     const { changes, problems } = diffXmlTrees(originalRoot, editedRoot, options);
@@ -1015,7 +1120,7 @@ class NativeDcbSession {
       throw new Error(`Record ${index} is out of range`);
     }
 
-    const editedRoot = annotateXmlPaths(parseXmlDocument(editedXmlText));
+    const editedRoot = annotateXmlPaths(parseXmlDocument(expandSrgb8XmlText(editedXmlText)));
     const editedType = String(editedRoot.attrs?.Type || (String(editedRoot.name || '').includes('.') ? String(editedRoot.name).split('.')[0] : '')).trim();
     if (editedType && editedType !== summary.typeName) {
       throw new Error(`Replacement XML type '${editedType}' does not match record type '${summary.typeName}'`);
@@ -1074,7 +1179,7 @@ class NativeDcbSession {
   }
 
   exportRecordXml(index) {
-    return this.exportExpandedXml(index);
+    return collapseSrgb8XmlText(this.exportExpandedXml(index));
   }
 
   exportExpandedXml(index) {
@@ -1650,7 +1755,7 @@ class NativeDcbSession {
   _buildRecordEditableFieldIndex(index, rootNode = null) {
     const record = this.records[index];
     const summary = this.recordSummaries[index];
-    const parsedRoot = annotateXmlPaths(rootNode || parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`));
+    const parsedRoot = annotateXmlPaths(rootNode || parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`));
     const fieldIndex = new Map();
     const activeInstances = new Set();
     const structNameToIndex = this._getStructNameToIndexMap();
@@ -1875,7 +1980,7 @@ class NativeDcbSession {
   _buildRecordArrayFieldIndex(index, rootNode = null) {
     const record = this.records[index];
     const summary = this.recordSummaries[index];
-    const parsedRoot = annotateXmlPaths(rootNode || parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`));
+    const parsedRoot = annotateXmlPaths(rootNode || parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`));
     const arrayIndex = new Map();
     const activeInstances = new Set();
     const getStructOffset = (structIndex, instanceIndex) => {
@@ -2084,7 +2189,7 @@ class NativeDcbSession {
     let changedValues = 0;
 
     while (true) {
-      const originalRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`));
+      const originalRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`));
       const originalArrays = this._buildRecordArrayFieldIndex(index, originalRoot);
       let handled = false;
 
@@ -2112,7 +2217,7 @@ class NativeDcbSession {
           if (sameExistingPrefix && editedChildren.length > originalChildren.length) {
             const oldCount = originalChildren.length;
             const allocation = this._appendClassArrayEntries(descriptor, editedChildren.length);
-            const refreshedRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`));
+            const refreshedRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`));
             const refreshedArrays = this._buildRecordArrayFieldIndex(index, refreshedRoot);
             const refreshedDescriptor = refreshedArrays.get(originalNode._path);
             if (!refreshedDescriptor) {
@@ -2184,7 +2289,7 @@ class NativeDcbSession {
     let changedValues = 0;
 
     while (true) {
-      const originalRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`));
+      const originalRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`));
       const originalArrays = this._buildRecordArrayFieldIndex(index, originalRoot);
       let handled = false;
 
@@ -2210,7 +2315,7 @@ class NativeDcbSession {
           if (sameExistingPrefix && editedChildren.length > originalChildren.length) {
             const appended = editedChildren.slice(originalChildren.length);
             const allocations = this._allocateStructTargetsForXmlNodes(appended, context, descriptor.itemTypeName || '');
-            const refreshedRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportRecordXml(index)}\n`));
+            const refreshedRoot = annotateXmlPaths(parseXmlDocument(`<?xml version="1.0" encoding="utf-8"?>\n${this.exportExpandedXml(index)}\n`));
             const refreshedArrays = this._buildRecordArrayFieldIndex(index, refreshedRoot);
             const refreshedDescriptor = refreshedArrays.get(originalNode._path);
             if (!refreshedDescriptor) {
@@ -2961,6 +3066,7 @@ class NativeDcbSession {
     this.enumValueCache = new Map();
     this.stringTable1Lookup = null;
     this.structNameToIndex = null;
+    this.structSubtypesCache = null;
     this.recordGuidToIndex = null;
     this.fileNameToMainRecordIndex = null;
     this.mainRecordFileCounts = null;
